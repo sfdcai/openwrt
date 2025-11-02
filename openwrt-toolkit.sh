@@ -18,7 +18,7 @@
 set -eu
 
 SCRIPT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-MODULE_DIR="${SCRIPT_ROOT}/scripts"
+MODULE_DIRS="scripts legacy"
 
 # shellcheck disable=SC2039
 usage() {
@@ -31,59 +31,85 @@ Usage: openwrt-toolkit.sh [--list | --run <name> | --help]
 Options:
   --list          Print available tools and exit
   --run <name>    Execute the tool identified by its name (file stem)
+                  Use prefixes such as "legacy/<tool>" for legacy items
   --help          Show this help message
 
 Without arguments the toolkit will launch an interactive menu.
 USAGE
 }
 
-require_module_dir() {
-  if [ ! -d "$MODULE_DIR" ]; then
-    printf >&2 'Error: scripts directory not found at %s\n' "$MODULE_DIR"
-    exit 1
-  fi
+require_module_dirs() {
+  for dir in $MODULE_DIRS; do
+    if [ -d "${SCRIPT_ROOT}/${dir}" ]; then
+      return
+    fi
+  done
+  printf >&2 'Error: no script directories found under %s\n' "$SCRIPT_ROOT"
+  exit 1
 }
 
 # shellcheck disable=SC2039
 discover_tools() {
-  require_module_dir
-  # Format: name<TAB>description<TAB>path
-  find "$MODULE_DIR" -maxdepth 1 -type f -name '*.sh' | while IFS= read -r script; do
-    [ -f "$script" ] || continue
-    if grep -q '^# TOOL_HIDDEN:[[:space:]]*true' "$script"; then
-      continue
-    fi
-    name=$(grep -m1 '^# TOOL_NAME:' "$script" | sed 's/^# TOOL_NAME:[[:space:]]*//') || true
-    desc=$(grep -m1 '^# TOOL_DESC:' "$script" | sed 's/^# TOOL_DESC:[[:space:]]*//') || true
-    [ -n "$name" ] || name=$(basename "$script" .sh)
-    [ -n "$desc" ] || desc="Run $(basename "$script")"
-    printf '%s\t%s\t%s\n' "$name" "$desc" "$script"
+  require_module_dirs
+  # Format: display<TAB>description<TAB>path<TAB>key
+  for dir in $MODULE_DIRS; do
+    module_dir="${SCRIPT_ROOT}/${dir}"
+    [ -d "$module_dir" ] || continue
+    find "$module_dir" -maxdepth 1 -type f -name '*.sh' | while IFS= read -r script; do
+      [ -f "$script" ] || continue
+      if grep -q '^# TOOL_HIDDEN:[[:space:]]*true' "$script"; then
+        continue
+      fi
+      stem=$(basename "$script" .sh)
+      display=$(grep -m1 '^# TOOL_NAME:' "$script" | sed 's/^# TOOL_NAME:[[:space:]]*//') || true
+      desc=$(grep -m1 '^# TOOL_DESC:' "$script" | sed 's/^# TOOL_DESC:[[:space:]]*//') || true
+      [ -n "$desc" ] || desc="Run $(basename "$script")"
+      key="$stem"
+      if [ "$dir" = "legacy" ]; then
+        [ -n "$display" ] || display="Legacy: $stem"
+        key="legacy/$stem"
+        case $desc in
+          Legacy*) ;;
+          *) desc="Legacy script: $desc" ;;
+        esac
+      else
+        [ -n "$display" ] || display="$stem"
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$script" "$key"
+    done
   done | sort
 }
 
 list_tools() {
-  discover_tools | while IFS="\t" read -r name desc _path; do
-    printf '%-25s %s\n' "$name" "$desc"
+  discover_tools | while IFS='	' read -r display desc _path _key; do
+    printf '%s - %s\n' "$display" "$desc"
   done
 }
 
 run_tool_by_stem() {
   stem=$1
-  require_module_dir
-  for script in "$MODULE_DIR/${stem}.sh" "$MODULE_DIR/${stem}"; do
-    if [ -f "$script" ]; then
-      sh "$script"
-      return
+  require_module_dirs
+  match=$(discover_tools | while IFS='	' read -r display _desc path key; do
+    if [ "$key" = "$stem" ]; then
+      printf '%s\t%s\n' "$display" "$path"
+      break
     fi
-  done
-  printf >&2 'Error: tool "%s" not found in %s\n' "$stem" "$MODULE_DIR"
-  exit 1
+  done)
+  if [ -z "$match" ]; then
+    printf >&2 'Error: tool "%s" not found. Use --list to view options.\n' "$stem"
+    exit 1
+  fi
+  display=$(printf '%s' "$match" | cut -f1)
+  path=$(printf '%s' "$match" | cut -f2)
+  printf 'Running %s...\n\n' "$display"
+  sh "$path"
+  printf '\nCompleted %s.\n' "$display"
 }
 
 interactive_menu() {
   tools=$(discover_tools)
   if [ -z "$tools" ]; then
-    printf >&2 'No tools found in %s\n' "$MODULE_DIR"
+    printf >&2 'No tools found under %s (searched: %s)\n' "$SCRIPT_ROOT" "$MODULE_DIRS"
     exit 1
   fi
 
@@ -93,8 +119,8 @@ interactive_menu() {
     idx=1
     printf '  %2s) %s\n' "Q" "Quit"
     printf '  %2s) %s\n' "R" "Refresh list"
-    echo "$tools" | while IFS="\t" read -r name desc path; do
-      printf '  %2d) %-22s %s\n' "$idx" "$name" "$desc"
+    printf '%s\n' "$tools" | while IFS='	' read -r display desc path key; do
+      printf '  %2d) %s - %s\n' "$idx" "$display" "$desc"
       idx=$((idx + 1))
     done
 
@@ -116,11 +142,11 @@ interactive_menu() {
         if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
           selected=$(echo "$tools" | sed -n "${choice}p") || true
           if [ -n "$selected" ]; then
-            name=$(printf '%s' "$selected" | cut -f1)
+            display=$(printf '%s' "$selected" | cut -f1)
             path=$(printf '%s' "$selected" | cut -f3)
-            printf '\nRunning %s...\n\n' "$name"
+            printf '\nRunning %s...\n\n' "$display"
             sh "$path"
-            printf '\nCompleted %s.\n' "$name"
+            printf '\nCompleted %s.\n' "$display"
           else
             printf 'Invalid selection.\n'
           fi
