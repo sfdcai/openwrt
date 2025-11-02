@@ -1,332 +1,281 @@
 #!/bin/sh
+# TOOL_NAME: USB storage helper
+# TOOL_DESC: Prepare and mount USB storage with swap support
 #
-# OpenWrt 24.10+ Extroot + Maintenance Utility (Interactive)
-# ----------------------------------------------------------
-# Adds swap management, filesystem optimisation helpers, and additional
-# safety checks to the original menu-driven workflow.
+# Prepares an existing USB partition for use as data or overlay storage,
+# optionally formats it, provisions a swap file, and registers persistent
+# mounts via /etc/config/fstab. The workflow favours core BusyBox utilities
+# so it works on stock OpenWrt 24.10 installations.
 
-set -e
+set -eu
 
-# ===== Colors =====
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+usage() {
+  cat <<'USAGE'
+Usage: setup-usb-storage.sh [OPTIONS]
 
-print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
-print_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+Options:
+  --device <path>        Block device or partition (e.g. /dev/sda1)
+  --partition <path>     Explicit partition path (overrides automatic guess)
+  --mount <dir>          Mount point to create/update (default: /mnt/<partition>)
+  --swap <size>          Swap size in MiB to allocate (default: 256, 0 disables)
+  --fs <type>            Filesystem type when formatting (default: ext4)
+  --format               Format the partition before mounting
+  --create-partition     Create a single partition if missing (requires parted)
+  --dry-run              Show actions without executing them
+  --help                 Display this message
 
-# ===== Paths and Defaults =====
-USB_DEVICE=""
-USB_MOUNT="/mnt"
-OVERLAY_UPPER="$USB_MOUNT/upper"
-OVERLAY_WORK="$USB_MOUNT/work"
-SWAP_FILE_DEFAULT="$USB_MOUNT/swapfile"
-SWAP_SIZE_MB_DEFAULT=512
-FSTAB_FILE="/etc/config/fstab"
-OPKG_FEEDS="/etc/opkg/distfeeds.conf"
-
-# ===== Helpers =====
-
-require_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        print_error "This script must be run as root."
-        exit 1
-    fi
+Examples:
+  setup-usb-storage.sh --device /dev/sda1 --mount /mnt/usb
+  setup-usb-storage.sh --device /dev/sda --create-partition --format --swap 512
+USAGE
 }
 
-ensure_usb_selected() {
-    if [ -z "$USB_DEVICE" ]; then
-        print_warn "No USB device selected yet. Choose option 1 first."
-        return 1
-    fi
-    return 0
+DEVICE=""
+PARTITION=""
+MOUNT_POINT=""
+SWAP_SIZE=256
+FS_TYPE="ext4"
+DRY_RUN=0
+DO_FORMAT=0
+CREATE_PARTITION=0
+TARGET_PART=""
+
+log() {
+  printf '[setup-usb] %s\n' "$*"
 }
 
-ensure_mountpoint() {
-    mkdir -p "$USB_MOUNT"
-    if ! mountpoint -q "$USB_MOUNT"; then
-        mount "$USB_DEVICE" "$USB_MOUNT"
-        print_info "Mounted $USB_DEVICE at $USB_MOUNT"
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "DRY: $*"
+  else
+    log "CMD: $*"
+    if ! "$@"; then
+      log "ERROR: Command failed ($*)"
+      exit 1
     fi
+  fi
 }
 
-append_unique_block() {
-    # $1 -> pattern, $2 -> block
-    local pattern="$1"
-    local block="$2"
-
-    if grep -q "$pattern" "$FSTAB_FILE" 2>/dev/null; then
-        return 0
-    fi
-
-    printf '\n%s\n' "$block" >> "$FSTAB_FILE"
+strip_partition_suffix() {
+  path=$1
+  case $path in
+    *p[0-9]*)
+      printf '%s' "${path%p[0-9]*}"
+      ;;
+    *[0-9])
+      printf '%s' "${path%[0-9]*}"
+      ;;
+    *)
+      printf '%s' "$path"
+      ;;
+  esac
 }
 
-# ===== Core Actions =====
-
-auto_detect_usb() {
-    print_info "Detecting available USB partitions..."
-    USB_LIST=$(lsblk -lnpo NAME,SIZE,TYPE | grep 'part' | grep '/dev/sd' | awk '{print $1 " (" $2 ")"}')
-    if [ -z "$USB_LIST" ]; then
-        print_error "No USB partitions detected!"
-        return 1
-    fi
-
-    echo "Available USB devices:"
-    echo "$USB_LIST"
-    echo
-    read -r -p "Enter the USB device path (e.g., /dev/sda1): " USB_DEVICE
-    if [ ! -b "$USB_DEVICE" ]; then
-        print_error "Invalid device: $USB_DEVICE"
-        USB_DEVICE=""
-        return 1
-    fi
-    print_success "Using USB device: $USB_DEVICE"
+guess_partition_path() {
+  disk=$1
+  if [ -b "${disk}p1" ]; then
+    printf '%s\n' "${disk}p1"
+  elif [ -b "${disk}1" ]; then
+    printf '%s\n' "${disk}1"
+  else
+    # Return the most common suffix; caller will validate existence later.
+    case $disk in
+      *mmcblk*|*nvme*) printf '%sp1\n' "$disk" ;;
+      *) printf '%s1\n' "$disk" ;;
+    esac
+  fi
 }
 
-format_usb() {
-    ensure_usb_selected || return 1
+while [ $# -gt 0 ]; do
+  case $1 in
+    --device)
+      DEVICE=$2
+      shift 2
+      ;;
+    --partition)
+      PARTITION=$2
+      shift 2
+      ;;
+    --mount)
+      MOUNT_POINT=$2
+      shift 2
+      ;;
+    --swap)
+      SWAP_SIZE=$2
+      shift 2
+      ;;
+    --fs)
+      FS_TYPE=$2
+      shift 2
+      ;;
+    --format)
+      DO_FORMAT=1
+      shift
+      ;;
+    --create-partition)
+      CREATE_PARTITION=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf >&2 'Unknown option: %s\n\n' "$1"
+      usage
+      exit 1
+      ;;
+  esac
+done
 
-    print_warn "⚠️  This will ERASE all data on $USB_DEVICE."
-    read -r -p "Do you want to format $USB_DEVICE as ext4? (yes/no): " CONFIRM
-    if [ "$CONFIRM" = "yes" ]; then
-        umount "$USB_DEVICE" 2>/dev/null || true
-        print_info "Formatting $USB_DEVICE as ext4..."
-        mkfs.ext4 -F "$USB_DEVICE"
-        print_success "$USB_DEVICE formatted successfully."
-    else
-        print_info "Skipping format step."
+if [ -z "$DEVICE" ] && [ -z "$PARTITION" ]; then
+  printf >&2 'Error: provide --device or --partition to identify the USB storage.\n'
+  usage
+  exit 1
+fi
+
+case $SWAP_SIZE in
+  ''|*[!0-9]*)
+    printf >&2 'Error: --swap expects a numeric size in MiB.\n'
+    exit 1
+    ;;
+  *)
+    :
+    ;;
+esac
+
+resolve_targets() {
+  if [ -n "$PARTITION" ]; then
+    TARGET_PART=$PARTITION
+    if [ -z "$DEVICE" ]; then
+      DEVICE=$(strip_partition_suffix "$PARTITION")
     fi
+  else
+    if [ -z "$DEVICE" ]; then
+      printf >&2 'Error: unable to determine device path.\n'
+      exit 1
+    fi
+    case $DEVICE in
+      *[0-9])
+        TARGET_PART=$DEVICE
+        DEVICE=$(strip_partition_suffix "$DEVICE")
+        ;;
+      *)
+        TARGET_PART=$(guess_partition_path "$DEVICE")
+        ;;
+    esac
+  fi
 }
 
-setup_extroot() {
-    ensure_usb_selected || return 1
-
-    print_info "Starting extroot setup..."
-
-    USB_UUID=$(block info | grep "$USB_DEVICE" | sed 's/.*UUID="\([^"]*\)".*/\1/')
-    if [ -z "$USB_UUID" ]; then
-        print_error "Could not detect UUID for $USB_DEVICE"
-        return 1
-    fi
-    print_success "Detected UUID: $USB_UUID"
-
-    ensure_mountpoint
-
-    mkdir -p "$OVERLAY_UPPER" "$OVERLAY_WORK"
-    print_success "Overlay structure prepared."
-
-    if [ -d "/overlay" ] && [ "$(ls -A /overlay 2>/dev/null)" ]; then
-        print_info "Copying current overlay to USB..."
-        cp -a /overlay/* "$OVERLAY_UPPER/" 2>/dev/null || true
-        print_success "Overlay data copied."
-    fi
-
-    umount /overlay 2>/dev/null || true
-    if mount -t overlay overlay -o "lowerdir=/,upperdir=$OVERLAY_UPPER,workdir=$OVERLAY_WORK" /overlay; then
-        print_success "Overlay mounted successfully."
-    else
-        print_error "Overlay test mount failed."
-        return 1
-    fi
-
-    print_info "Writing fstab..."
-    cat > "$FSTAB_FILE" <<EOF
-config global
-        option anon_swap '0'
-        option anon_mount '0'
-        option auto_swap '1'
-        option auto_mount '1'
-        option delay_root '5'
-        option check_fs '1'
-
-config mount
-        option target '/overlay'
-        option uuid '$USB_UUID'
-        option fstype 'ext4'
-        option options 'rw,noatime,nodiratime,data=writeback'
-        option enabled '1'
-        option enabled_fsck '1'
-EOF
-
-    print_success "fstab configured for extroot."
-
-    if ! grep -q "sleep 5" /etc/rc.local 2>/dev/null; then
-        sed -i '/^exit 0$/i sleep 5' /etc/rc.local
-        print_success "Added boot delay for USB initialization."
-    fi
-
-    /etc/init.d/fstab enable
-    print_success "fstab service enabled."
-
-    print_warn "✅ Extroot setup completed! Reboot to activate."
-    echo "After reboot, verify with:"
-    echo "  mount | grep overlay"
-    echo "  df -h | grep overlay"
+ensure_block_present() {
+  path=$1
+  if [ ! -b "$path" ]; then
+    return 1
+  fi
+  return 0
 }
 
-ensure_swap_entry() {
-    local swap_path="$1"
-    append_unique_block "option device '$swap_path'" "config swap\n        option device '$swap_path'\n        option enabled '1'\n        option priority '1'"
+create_partition_if_needed() {
+  if ensure_block_present "$TARGET_PART"; then
+    return
+  fi
+
+  if [ "$CREATE_PARTITION" -eq 0 ]; then
+    log "Partition $TARGET_PART not found. Provide --partition or install partitioning tools."
+    exit 1
+  fi
+
+  if ! command -v parted >/dev/null 2>&1; then
+    log "parted is required for --create-partition but is not installed."
+    exit 1
+  fi
+
+  log "Creating partition on $DEVICE"
+  run parted -s "$DEVICE" mklabel gpt
+  run parted -s "$DEVICE" mkpart primary "$FS_TYPE" 1MiB 100%
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return
+  fi
+  sleep 1
+  TARGET_PART=$(guess_partition_path "$DEVICE")
+  if ! ensure_block_present "$TARGET_PART"; then
+    log "Unable to detect new partition at $TARGET_PART."
+    exit 1
+  fi
 }
 
-create_swap() {
-    ensure_usb_selected || return 1
-
-    ensure_mountpoint
-
-    local swap_file="$SWAP_FILE_DEFAULT"
-    local swap_size="$SWAP_SIZE_MB_DEFAULT"
-
-    read -r -p "Swap file path [$swap_file]: " input_path
-    if [ -n "$input_path" ]; then
-        swap_file="$input_path"
-    fi
-
-    read -r -p "Swap size in MB [$swap_size]: " input_size
-    if [ -n "$input_size" ]; then
-        if echo "$input_size" | grep -qE '^[0-9]+$'; then
-            swap_size="$input_size"
-        else
-            print_error "Invalid size."
-            return 1
-        fi
-    fi
-
-    if [ -f "$swap_file" ]; then
-        print_warn "Existing swap file found. It will be recreated."
-        swapoff "$swap_file" 2>/dev/null || true
-    fi
-
-    print_info "Creating swap file ($swap_size MB) at $swap_file"
-    dd if=/dev/zero of="$swap_file" bs=1M count="$swap_size"
-    chmod 600 "$swap_file"
-    mkswap "$swap_file"
-    swapon "$swap_file" || print_warn "Swap activation failed."
-
-    ensure_swap_entry "$swap_file"
-    print_success "Swap file configured."
+format_partition() {
+  if [ "$DO_FORMAT" -eq 0 ]; then
+    log "Skipping filesystem format; use --format to wipe $TARGET_PART if required."
+    return
+  fi
+  mkfs_tool="mkfs.$FS_TYPE"
+  if ! command -v "$mkfs_tool" >/dev/null 2>&1; then
+    log "$mkfs_tool not found. Install the appropriate filesystem utilities (e.g. e2fsprogs)."
+    exit 1
+  fi
+  run "$mkfs_tool" "$TARGET_PART"
 }
 
-optimize_system() {
-    if ! ensure_usb_selected; then
-        print_warn "Select a USB device first to run optimisation commands."
-        return 0
-    fi
-    print_info "Applying filesystem optimisations..."
-
-    if command -v tune2fs >/dev/null 2>&1; then
-        tune2fs -o journal_data_writeback "$USB_DEVICE" >/dev/null 2>&1 || true
-    fi
-
-    if command -v sysctl >/dev/null 2>&1; then
-        sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-        sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
-    fi
-
-    print_success "Optimisation commands applied."
+mount_filesystem() {
+  if [ -z "$MOUNT_POINT" ]; then
+    name=$(basename "$TARGET_PART")
+    MOUNT_POINT="/mnt/$name"
+    log "Using default mount point $MOUNT_POINT"
+  fi
+  run mkdir -p "$MOUNT_POINT"
+  run mount "$TARGET_PART" "$MOUNT_POINT"
+  if command -v uci >/dev/null 2>&1; then
+    log "Persisting mount in /etc/config/fstab"
+    run uci -q delete fstab.usb || true
+    run uci set fstab.usb=mount
+    run uci set fstab.usb.target="$MOUNT_POINT"
+    run uci set fstab.usb.device="$TARGET_PART"
+    run uci set fstab.usb.enabled='1'
+    run uci commit fstab
+  fi
 }
 
-fix_opkg() {
-    print_info "Fixing opkg HTTPS issues..."
-
-    ntpd -q -p pool.ntp.org || print_warn "NTP sync failed, continuing."
-
-    sed -i 's/https:/http:/g' "$OPKG_FEEDS"
-    if opkg update; then
-        print_success "opkg update (HTTP) completed."
-    else
-        print_error "HTTP update failed."
-        return 1
-    fi
-
-    if opkg install ca-certificates; then
-        print_success "ca-certificates installed."
-    else
-        print_error "Failed to install ca-certificates."
-    fi
-
-    sed -i 's/http:/https:/g' "$OPKG_FEEDS"
-    if opkg update; then
-        print_success "opkg update (HTTPS) verified."
-    else
-        print_warn "HTTPS update failed to verify."
-    fi
+provision_swap() {
+  [ "$SWAP_SIZE" -gt 0 ] 2>/dev/null || return
+  run mkdir -p "$MOUNT_POINT"
+  swapfile="$MOUNT_POINT/swapfile"
+  run dd if=/dev/zero of="$swapfile" bs=1M count="$SWAP_SIZE"
+  run chmod 600 "$swapfile"
+  run mkswap "$swapfile"
+  if command -v swapon >/dev/null 2>&1; then
+    run swapon "$swapfile"
+  fi
+  if command -v uci >/dev/null 2>&1; then
+    log "Registering swapfile in /etc/config/fstab"
+    run uci -q delete fstab.swap || true
+    run uci set fstab.swap=swap
+    run uci set fstab.swap.enabled='1'
+    run uci set fstab.swap.device="$swapfile"
+    run uci commit fstab
+  fi
 }
 
-show_info() {
-    echo
-    echo "System Info:"
-    echo "============"
-    df -h | grep overlay || echo "Overlay not mounted yet."
-    block info | grep UUID || echo "No block device UUID found."
-    swapon --show || echo "No swap active."
-    echo
-    echo "fstab content:"
-    echo "---------------"
-    cat "$FSTAB_FILE"
+summarise() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Dry-run complete"
+  else
+    log "USB storage setup finished"
+    df -h "$MOUNT_POINT" 2>/dev/null || true
+  fi
 }
 
-show_summary() {
-    echo
-    echo "Current Configuration Summary"
-    echo "------------------------------"
-    echo "Selected USB device : ${USB_DEVICE:-<not selected>}"
-    mountpoint -q "$USB_MOUNT" && echo "USB mount point     : $USB_MOUNT" || echo "USB mount point     : not mounted"
-    [ -d "$OVERLAY_UPPER" ] && echo "Overlay upper dir   : $OVERLAY_UPPER" || echo "Overlay upper dir   : missing"
-    [ -d "$OVERLAY_WORK" ] && echo "Overlay work dir    : $OVERLAY_WORK" || echo "Overlay work dir    : missing"
-    SWAP_INFO=$(swapon --show 2>/dev/null | awk 'NR>1 {print $1" ("$3")"}')
-    if [ -n "$SWAP_INFO" ]; then
-        echo "Active swap         : $SWAP_INFO"
-    else
-        echo "Active swap         : none"
-    fi
-}
-
-# ===== Menu =====
-show_menu() {
-    echo
-    echo "=============================================="
-    echo " OpenWrt 24.10+ System Utility"
-    echo "=============================================="
-    echo "1) Auto-detect USB device"
-    echo "2) Format USB (ext4)"
-    echo "3) Setup Extroot (overlay)"
-    echo "4) Create or refresh swap file"
-    echo "5) Fix opkg HTTPS & install certs"
-    echo "6) Apply optimisation tweaks"
-    echo "7) Show system info"
-    echo "8) Show configuration summary"
-    echo "9) Reboot"
-    echo "0) Exit"
-    echo "=============================================="
-    echo
-}
-
-main_loop() {
-    while true; do
-        show_menu
-        read -r -p "Select an option: " CHOICE
-        case "$CHOICE" in
-            1) auto_detect_usb ;;
-            2) format_usb ;;
-            3) setup_extroot ;;
-            4) create_swap ;;
-            5) fix_opkg ;;
-            6) optimize_system ;;
-            7) show_info ;;
-            8) show_summary ;;
-            9) print_info "Rebooting..."; reboot ;;
-            0) print_info "Exiting."; exit 0 ;;
-            *) print_warn "Invalid option. Try again." ;;
-        esac
-        echo
-    done
-}
-
-require_root
-main_loop
+resolve_targets
+create_partition_if_needed
+format_partition
+if ! ensure_block_present "$TARGET_PART"; then
+  log "Partition $TARGET_PART is not available; aborting."
+  exit 1
+fi
+mount_filesystem
+provision_swap
+summarise

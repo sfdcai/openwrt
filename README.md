@@ -19,7 +19,8 @@ sh -c 'cd /tmp && rm -rf openwrt-main \
 ```
 
 From the menu you can run any helper interactively, refresh the list after
-adding new modules, or quit. The CLI also supports scripting:
+adding new modules, or jump into the **Legacy scripts** submenu to access the
+original utilities. The CLI also supports scripting:
 
 ```sh
 ./openwrt-toolkit.sh --list              # show everything the launcher found
@@ -45,13 +46,14 @@ legacy/                 # Original scripts retained for compatibility
 | `backup-config` | Creates archives of `/etc/config`, optional UCI exports, and package manifests. |
 | `system-health-report` | Summarises load, memory, storage, network, and package update status. |
 | `install-telegram-bot` | Downloads and runs the installer from [`sfdcai/openwrt-telegram`](https://github.com/sfdcai/openwrt-telegram). |
+| `command-inventory` | Writes a sorted list of BusyBox applets and PATH executables to aid script portability. |
 
 Each script documents extra flags via `--help` and declares `# TOOL_NAME` and
 `# TOOL_DESC` metadata so the launcher can present friendly descriptions.
 
 ### Legacy helpers (`legacy/`)
 The original maintenance scripts remain available and show up in the launcher as
-`legacy/<name>` entries:
+`legacy/<name>` entries accessed via the dedicated submenu:
 
 | Tool | Notes |
 | --- | --- |
@@ -80,6 +82,13 @@ installer once downloaded:
 ```sh
 ./openwrt-toolkit.sh --run install-telegram-bot -- --token abc123
 ```
+
+## Capture available commands
+Use `./openwrt-toolkit.sh --run command-inventory` to generate
+`/tmp/openwrt-commands.txt`, a reference of BusyBox applets and standalone
+executables on the current firmware image. The report makes it easy to confirm
+which tools exist on OpenWrt 24.10 before writing new automation. Add
+`--print` to stream the inventory directly to the terminal.
 
 ## Extend the toolkit
 1. Drop a new executable shell script in `scripts/` (or add metadata to a legacy

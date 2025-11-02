@@ -2,23 +2,16 @@
 #
 # OpenWrt Toolkit Menu
 #
-# This launcher discovers helper scripts stored in the local scripts/
-# directory and presents a simple interactive menu for invoking them.
-# Each managed script can optionally declare metadata in the form of the
-# following comments near the top of the file:
-#   # TOOL_NAME: Friendly script name
-#   # TOOL_DESC: One-line description shown in the menu
-# The launcher falls back to the script file name if no TOOL_NAME is
-# provided and suppresses scripts that opt-out with "# TOOL_HIDDEN: true".
-#
-# This file is self-contained and does not modify any of the existing
-# top-level helper scripts, allowing the newly enhanced tools to live in
-# the dedicated scripts/ directory.
+# Presents an interactive launcher for helper scripts stored under
+# scripts/ (modern modules) and legacy/ (historic utilities). Legacy
+# entries are accessible through a dedicated submenu so that new helpers
+# remain front and centre while backwards compatibility is preserved.
 
 set -eu
 
 SCRIPT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 MODULE_DIRS="scripts legacy"
+TAB="$(printf '\t')"
 
 # shellcheck disable=SC2039
 usage() {
@@ -29,12 +22,11 @@ OpenWrt Toolkit
 Usage: openwrt-toolkit.sh [--list | --run <name> | --help]
 
 Options:
-  --list          Print available tools and exit
-  --run <name>    Execute the tool identified by its name (file stem)
-                  Use prefixes such as "legacy/<tool>" for legacy items
+  --list          Print available tools grouped by category
+  --run <name>    Execute a tool (use legacy/<name> for legacy items)
   --help          Show this help message
 
-Without arguments the toolkit will launch an interactive menu.
+Without arguments the toolkit launches an interactive menu.
 USAGE
 }
 
@@ -51,7 +43,9 @@ require_module_dirs() {
 # shellcheck disable=SC2039
 discover_tools() {
   require_module_dirs
-  # Format: display<TAB>description<TAB>path<TAB>key
+  modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
+  legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+
   for dir in $MODULE_DIRS; do
     module_dir="${SCRIPT_ROOT}/${dir}"
     [ -d "$module_dir" ] || continue
@@ -64,37 +58,83 @@ discover_tools() {
       display=$(grep -m1 '^# TOOL_NAME:' "$script" | sed 's/^# TOOL_NAME:[[:space:]]*//') || true
       desc=$(grep -m1 '^# TOOL_DESC:' "$script" | sed 's/^# TOOL_DESC:[[:space:]]*//') || true
       [ -n "$desc" ] || desc="Run $(basename "$script")"
-      key="$stem"
       if [ "$dir" = "legacy" ]; then
-        [ -n "$display" ] || display="Legacy: $stem"
+        [ -n "$display" ] || display="$stem"
         key="legacy/$stem"
-        case $desc in
-          Legacy*) ;;
-          *) desc="Legacy script: $desc" ;;
-        esac
+        printf '%s\t%s\t%s\t%s\n' "$display" "Legacy script: $desc" "$script" "$key" >>"$legacy_tmp"
       else
         [ -n "$display" ] || display="$stem"
+        key="$stem"
+        printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$script" "$key" >>"$modern_tmp"
       fi
-      printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$script" "$key"
     done
-  done | sort
+  done
+
+  if [ -s "$modern_tmp" ]; then
+    while IFS= read -r line; do
+      printf 'modern\t%s\n' "$line"
+    done <"$modern_tmp" | sort
+  fi
+  if [ -s "$legacy_tmp" ]; then
+    while IFS= read -r line; do
+      printf 'legacy\t%s\n' "$line"
+    done <"$legacy_tmp" | sort
+  fi
+
+  rm -f "$modern_tmp" "$legacy_tmp"
 }
 
 list_tools() {
-  discover_tools | while IFS='	' read -r display desc _path _key; do
-    printf '%s - %s\n' "$display" "$desc"
+  tools=$(discover_tools)
+  if [ -z "$tools" ]; then
+    printf 'No tools discovered.\n'
+    return
+  fi
+
+  modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
+  legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+
+  printf '%s\n' "$tools" | while IFS="$TAB" read -r category display desc _path key; do
+    case $category in
+      modern)
+        printf '%s\t%s\t%s\n' "$display" "$desc" "$key" >>"$modern_tmp"
+        ;;
+      legacy)
+        printf '%s\t%s\t%s\n' "$display" "$desc" "$key" >>"$legacy_tmp"
+        ;;
+    esac
   done
+
+  if [ -s "$modern_tmp" ]; then
+    printf 'Modern scripts:\n'
+    while IFS="$TAB" read -r display desc key; do
+      printf '  %s - %s (run: %s)\n' "$display" "$desc" "$key"
+    done <"$modern_tmp"
+  fi
+
+  if [ -s "$legacy_tmp" ]; then
+    printf '\nLegacy scripts:\n'
+    while IFS="$TAB" read -r display desc key; do
+      printf '  %s - %s (run: %s)\n' "$display" "$desc" "$key"
+    done <"$legacy_tmp"
+  fi
+
+  rm -f "$modern_tmp" "$legacy_tmp"
 }
 
 run_tool_by_stem() {
   stem=$1
-  require_module_dirs
-  match=$(discover_tools | while IFS='	' read -r display _desc path key; do
+  match=$(discover_tools | while IFS="$TAB" read -r category display _desc path key; do
     if [ "$key" = "$stem" ]; then
       printf '%s\t%s\n' "$display" "$path"
       break
     fi
+    if [ "$category" = "legacy" ] && [ "$key" = "legacy/$stem" ]; then
+      printf '%s\t%s\n' "$display" "$path"
+      break
+    fi
   done)
+
   if [ -z "$match" ]; then
     printf >&2 'Error: tool "%s" not found. Use --list to view options.\n' "$stem"
     exit 1
@@ -106,23 +146,95 @@ run_tool_by_stem() {
   printf '\nCompleted %s.\n' "$display"
 }
 
-interactive_menu() {
-  tools=$(discover_tools)
-  if [ -z "$tools" ]; then
-    printf >&2 'No tools found under %s (searched: %s)\n' "$SCRIPT_ROOT" "$MODULE_DIRS"
-    exit 1
+legacy_menu() {
+  legacy_tools=$1
+  if [ -z "$legacy_tools" ]; then
+    printf 'No legacy scripts available.\n'
+    return
   fi
 
   while true; do
-    printf '\nOpenWrt Toolkit Menu\n'
-    printf '--------------------\n'
+    printf '\nLegacy scripts\n'
+    printf '--------------\n'
+    printf '  %2s) %s\n' "B" "Back to main menu"
     idx=1
-    printf '  %2s) %s\n' "Q" "Quit"
-    printf '  %2s) %s\n' "R" "Refresh list"
-    printf '%s\n' "$tools" | while IFS='	' read -r display desc path key; do
+    printf '%s\n' "$legacy_tools" | while IFS="$TAB" read -r display desc path key; do
       printf '  %2d) %s - %s\n' "$idx" "$display" "$desc"
       idx=$((idx + 1))
     done
+
+    printf '\nSelect an option: '
+    IFS= read -r choice || return
+    case $choice in
+      [Bb])
+        return
+        ;;
+      '')
+        continue
+        ;;
+      *)
+        if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
+          selected=$(echo "$legacy_tools" | sed -n "${choice}p") || true
+          if [ -n "$selected" ]; then
+            display=$(printf '%s' "$selected" | cut -f1)
+            path=$(printf '%s' "$selected" | cut -f3)
+            printf '\nRunning %s...\n\n' "$display"
+            sh "$path"
+            printf '\nCompleted %s.\n' "$display"
+          else
+            printf 'Invalid selection.\n'
+          fi
+        else
+          printf 'Invalid selection.\n'
+        fi
+        ;;
+    esac
+  done
+}
+
+interactive_menu() {
+  while true; do
+    tools=$(discover_tools)
+    if [ -z "$tools" ]; then
+      printf >&2 'No tools found under %s (searched: %s)\n' "$SCRIPT_ROOT" "$MODULE_DIRS"
+      exit 1
+    fi
+
+    modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
+    legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+
+    printf '%s\n' "$tools" | while IFS="$TAB" read -r category display desc path key; do
+      case $category in
+        modern)
+          printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$path" "$key" >>"$modern_tmp"
+          ;;
+        legacy)
+          printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$path" "$key" >>"$legacy_tmp"
+          ;;
+      esac
+    done
+
+    modern_tools=$(cat "$modern_tmp" 2>/dev/null)
+    legacy_tools=$(cat "$legacy_tmp" 2>/dev/null)
+    rm -f "$modern_tmp" "$legacy_tmp"
+
+    printf '\nOpenWrt Toolkit Menu\n'
+    printf '--------------------\n'
+    printf '  %2s) %s\n' "Q" "Quit"
+    printf '  %2s) %s\n' "R" "Refresh list"
+    if [ -n "$legacy_tools" ]; then
+      printf '  %2s) %s\n' "L" "Legacy scripts..."
+    fi
+
+    idx=1
+    if [ -n "$modern_tools" ]; then
+      printf '%s\n' "$modern_tools" | while IFS="$TAB" read -r display desc path key; do
+        printf '  %2d) %s - %s\n' "$idx" "$display" "$desc"
+        idx=$((idx + 1))
+      done
+    else
+      printf '  -- No modern scripts discovered --\n'
+    fi
 
     printf '\nSelect an option: '
     IFS= read -r choice || exit 0
@@ -132,7 +244,10 @@ interactive_menu() {
         exit 0
         ;;
       [Rr])
-        tools=$(discover_tools)
+        continue
+        ;;
+      [Ll])
+        legacy_menu "$legacy_tools"
         continue
         ;;
       '')
@@ -140,7 +255,7 @@ interactive_menu() {
         ;;
       *)
         if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
-          selected=$(echo "$tools" | sed -n "${choice}p") || true
+          selected=$(echo "$modern_tools" | sed -n "${choice}p") || true
           if [ -n "$selected" ]; then
             display=$(printf '%s' "$selected" | cut -f1)
             path=$(printf '%s' "$selected" | cut -f3)
