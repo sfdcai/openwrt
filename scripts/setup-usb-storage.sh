@@ -26,7 +26,7 @@ Options:
 
 Examples:
   setup-usb-storage.sh --device /dev/sda1 --mount /mnt/usb
-  setup-usb-storage.sh --device /dev/sda --create-partition --format --swap 512
+  setup-usb-storage.sh --device /dev/sda --format --swap 512
 USAGE
 }
 
@@ -86,6 +86,96 @@ guess_partition_path() {
   fi
 }
 
+list_block_candidates() {
+  ls -1 /dev 2>/dev/null \
+    | egrep '^(sd[a-z][0-9]*|mmcblk[0-9]+(p[0-9]+)?|nvme[0-9]+n[0-9]+(p[0-9]+)?)$' \
+    | while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      printf '/dev/%s\n' "$entry"
+    done
+}
+
+prompt_for_partition() {
+  log "No device provided; attempting interactive selection."
+  stamp=$(date '+%s' 2>/dev/null || echo 0)
+  candidates_file="/tmp/setup-usb-candidates-${stamp}.$$"
+  list_block_candidates >"$candidates_file"
+  count=$(sed -n '$=' "$candidates_file")
+  [ -n "$count" ] || count=0
+
+  if [ "$count" -eq 0 ] 2>/dev/null; then
+    rm -f "$candidates_file"
+    printf >&2 'Error: no block devices detected. Connect the USB storage and rerun.\n'
+    exit 1
+  fi
+
+  printf 'Detected storage devices:\n'
+  idx=1
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    printf '  %2d) %s\n' "$idx" "$part"
+    idx=$((idx + 1))
+  done <"$candidates_file"
+
+  while true; do
+    candidate=""
+    printf '\nSelect a device [1-%s], enter a path, or type q to cancel: ' "$count"
+    IFS= read -r answer || {
+      rm -f "$candidates_file"
+      exit 1
+    }
+
+    case $answer in
+      [Qq])
+        rm -f "$candidates_file"
+        log "Aborted by user."
+        exit 0
+        ;;
+      '')
+        continue
+        ;;
+      *[!0-9]*)
+        candidate=$(printf '%s' "$answer" | tr -d ' \t')
+        ;;
+      *)
+        if [ "$answer" -ge 1 ] 2>/dev/null && [ "$answer" -le "$count" ] 2>/dev/null; then
+          candidate=$(sed -n "${answer}p" "$candidates_file")
+        else
+          printf 'Invalid selection.\n'
+          continue
+        fi
+        ;;
+    esac
+
+    [ -n "$candidate" ] || continue
+
+    case $candidate in
+      /dev/*)
+        chosen=$candidate
+        ;;
+      *)
+        if [ -b "/dev/$candidate" ]; then
+          chosen="/dev/$candidate"
+        else
+          printf 'Path %s is not recognised.\n' "$candidate"
+          candidate=""
+          continue
+        fi
+        ;;
+    esac
+
+    if ensure_block_present "$chosen"; then
+      PARTITION=$chosen
+      DEVICE=$(strip_partition_suffix "$chosen")
+      log "Selected partition $PARTITION"
+      rm -f "$candidates_file"
+      return
+    fi
+
+    printf '%s is not a block device.\n' "$chosen"
+  done
+}
+
 while [ $# -gt 0 ]; do
   case $1 in
     --device)
@@ -131,12 +221,6 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-
-if [ -z "$DEVICE" ] && [ -z "$PARTITION" ]; then
-  printf >&2 'Error: provide --device or --partition to identify the USB storage.\n'
-  usage
-  exit 1
-fi
 
 case $SWAP_SIZE in
   ''|*[!0-9]*)
@@ -266,6 +350,10 @@ ensure_usb_support_packages() {
     run opkg install "$pkg"
   done
 }
+
+if [ -z "$DEVICE" ] && [ -z "$PARTITION" ]; then
+  prompt_for_partition
+fi
 
 resolve_targets
 if ! ensure_block_present "$TARGET_PART"; then

@@ -67,11 +67,11 @@ show_status() {
   log "Overlay mount: $(mount | grep 'overlayfs:/overlay' || echo 'not mounted')"
   log "Mounted filesystems:"
   mount
-  log "Block info summary:"
-  if command -v block >/dev/null 2>&1; then
-    block info
+  log "Block device summary:"
+  if [ -f /proc/partitions ]; then
+    cat /proc/partitions
   else
-    log "block command not available"
+    log "/proc/partitions not available"
   fi
 }
 

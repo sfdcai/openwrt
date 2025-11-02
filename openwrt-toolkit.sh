@@ -12,6 +12,7 @@ set -eu
 SCRIPT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 MODULE_DIRS="scripts legacy"
 TAB="$(printf '\t')"
+LAST_TOOL_STATUS=0
 
 # shellcheck disable=SC2039
 usage() {
@@ -152,9 +153,26 @@ run_tool_by_stem() {
 
   display=$(printf '%s' "$match" | cut -f1)
   path=$(printf '%s' "$match" | cut -f2)
-  printf 'Running %s...\n\n' "$display"
+  if ! execute_tool "$display" "$path"; then
+    exit "$LAST_TOOL_STATUS"
+  fi
+}
+
+execute_tool() {
+  display=$1
+  path=$2
+  printf '\nRunning %s...\n\n' "$display"
   sh "$path"
-  printf '\nCompleted %s.\n' "$display"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    LAST_TOOL_STATUS=0
+    printf '\nCompleted %s.\n' "$display"
+    return 0
+  fi
+
+  LAST_TOOL_STATUS=$status
+  printf '\n%s exited with status %s.\n' "$display" "$status"
+  return "$status"
 }
 
 legacy_menu() {
@@ -189,9 +207,9 @@ legacy_menu() {
           if [ -n "$selected" ]; then
             display=$(printf '%s' "$selected" | cut -f1)
             path=$(printf '%s' "$selected" | cut -f3)
-            printf '\nRunning %s...\n\n' "$display"
-            sh "$path"
-            printf '\nCompleted %s.\n' "$display"
+            if ! execute_tool "$display" "$path"; then
+              printf 'Tool exited with status %s.\n' "$LAST_TOOL_STATUS"
+            fi
           else
             printf 'Invalid selection.\n'
           fi
@@ -273,9 +291,9 @@ interactive_menu() {
           if [ -n "$selected" ]; then
             display=$(printf '%s' "$selected" | cut -f1)
             path=$(printf '%s' "$selected" | cut -f3)
-            printf '\nRunning %s...\n\n' "$display"
-            sh "$path"
-            printf '\nCompleted %s.\n' "$display"
+            if ! execute_tool "$display" "$path"; then
+              printf 'Tool exited with status %s.\n' "$LAST_TOOL_STATUS"
+            fi
           else
             printf 'Invalid selection.\n'
           fi
