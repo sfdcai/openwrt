@@ -1,5 +1,8 @@
 name: Create Release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
@@ -9,19 +12,21 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Create tar archive
         run: |
           tar -czf main.tar.gz --exclude='.git' --exclude='.github' .
 
       - name: Create Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           files: main.tar.gz
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: "Release ${{ github.ref_name }}"
           draft: false
           prerelease: false
-          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
