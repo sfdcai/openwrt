@@ -101,10 +101,8 @@ if [ "$TRACE" -eq 1 ]; then
   log_section "Traceroute to $TRACE_TARGET"
   if command -v traceroute >/dev/null 2>&1; then
     traceroute "$TRACE_TARGET" || true
-  elif command -v mtr >/dev/null 2>&1; then
-    mtr -rw "$TRACE_TARGET" || true
   else
-    printf 'No traceroute or mtr command available\n'
+    printf 'traceroute command not available\n'
   fi
 fi
 

@@ -39,10 +39,10 @@ download_file() {
   dest=$2
   if command -v wget >/dev/null 2>&1; then
     wget -qO "$dest" "$url"
-  elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$dest" "$url"
+  elif command -v uclient-fetch >/dev/null 2>&1; then
+    uclient-fetch -q -O "$dest" "$url"
   else
-    printf >&2 'Error: Neither wget nor curl is available.\n'
+    printf >&2 'Error: Neither wget nor uclient-fetch is available.\n'
     exit 1
   fi
 }
@@ -104,7 +104,9 @@ main() {
     exit 0
   fi
 
-  tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t telegram)
+  stamp=$(date '+%s' 2>/dev/null || echo 0)
+  tmpdir="/tmp/openwrt-telegram-${stamp}.$$"
+  mkdir -p "$tmpdir"
   trap 'rm -rf "$tmpdir"' EXIT INT TERM HUP
   target="${tmpdir}/${script_name}"
 

@@ -72,10 +72,16 @@ list_path_commands() {
   paths=$1
   for dir in $paths; do
     [ -d "$dir" ] || continue
-    for file in "$dir"/*; do
-      [ -f "$file" ] || [ -L "$file" ] || continue
-      if [ -x "$file" ]; then
-        basename "$file"
+    for file in $dir/*; do
+      case $file in
+        $dir/*)
+          [ -e "$file" ] || continue
+          ;;
+      esac
+      if [ -f "$file" ] || [ -L "$file" ]; then
+        if [ -x "$file" ]; then
+          basename "$file"
+        fi
       fi
     done
   done | sort -u
@@ -90,7 +96,8 @@ collect_paths() {
 }
 
 write_report() {
-  tmp=$(mktemp 2>/dev/null || mktemp -t cmdinv.XXXXXX)
+  stamp=$(date '+%s' 2>/dev/null || echo 0)
+  tmp="/tmp/openwrt-command-inventory-${stamp}.$$"
   {
     printf '# OpenWrt command inventory generated on %s\n' "$(date 2>/dev/null || echo now)"
     printf '# Output file: %s\n' "$OUTPUT"
@@ -106,7 +113,8 @@ write_report() {
     list_path_commands "$(collect_paths)"
   } >"$tmp"
 
-  mkdir -p "$(dirname "$OUTPUT")"
+  out_dir=$(dirname "$OUTPUT")
+  [ -d "$out_dir" ] || mkdir -p "$out_dir"
   cp "$tmp" "$OUTPUT"
   rm -f "$tmp"
 }

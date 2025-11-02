@@ -20,7 +20,6 @@ Options:
   --swap <size>          Swap size in MiB to allocate (default: 256, 0 disables)
   --fs <type>            Filesystem type when formatting (default: ext4)
   --format               Format the partition before mounting
-  --create-partition     Create a single partition if missing (requires parted)
   --dry-run              Show actions without executing them
   --help                 Display this message
 
@@ -37,7 +36,6 @@ SWAP_SIZE=256
 FS_TYPE="ext4"
 DRY_RUN=0
 DO_FORMAT=0
-CREATE_PARTITION=0
 TARGET_PART=""
 
 log() {
@@ -112,10 +110,6 @@ while [ $# -gt 0 ]; do
       DO_FORMAT=1
       shift
       ;;
-    --create-partition)
-      CREATE_PARTITION=1
-      shift
-      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -179,35 +173,6 @@ ensure_block_present() {
   return 0
 }
 
-create_partition_if_needed() {
-  if ensure_block_present "$TARGET_PART"; then
-    return
-  fi
-
-  if [ "$CREATE_PARTITION" -eq 0 ]; then
-    log "Partition $TARGET_PART not found. Provide --partition or install partitioning tools."
-    exit 1
-  fi
-
-  if ! command -v parted >/dev/null 2>&1; then
-    log "parted is required for --create-partition but is not installed."
-    exit 1
-  fi
-
-  log "Creating partition on $DEVICE"
-  run parted -s "$DEVICE" mklabel gpt
-  run parted -s "$DEVICE" mkpart primary "$FS_TYPE" 1MiB 100%
-  if [ "$DRY_RUN" -eq 1 ]; then
-    return
-  fi
-  sleep 1
-  TARGET_PART=$(guess_partition_path "$DEVICE")
-  if ! ensure_block_present "$TARGET_PART"; then
-    log "Unable to detect new partition at $TARGET_PART."
-    exit 1
-  fi
-}
-
 format_partition() {
   if [ "$DO_FORMAT" -eq 0 ]; then
     log "Skipping filesystem format; use --format to wipe $TARGET_PART if required."
@@ -265,17 +230,16 @@ summarise() {
     log "Dry-run complete"
   else
     log "USB storage setup finished"
-    df -h "$MOUNT_POINT" 2>/dev/null || true
+    df "$MOUNT_POINT" 2>/dev/null || true
   fi
 }
 
 resolve_targets
-create_partition_if_needed
-format_partition
 if ! ensure_block_present "$TARGET_PART"; then
-  log "Partition $TARGET_PART is not available; aborting."
+  log "Partition $TARGET_PART not found. Create it on another system or specify --partition."
   exit 1
 fi
+format_partition
 mount_filesystem
 provision_swap
 summarise

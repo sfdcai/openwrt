@@ -73,11 +73,11 @@ main() {
 
   print_section "Resources"
   if command -v free >/dev/null 2>&1; then
-    free -h 2>/dev/null || free
+    free
   else
-    grep -E 'Mem|Swap' /proc/meminfo 2>/dev/null || printf 'meminfo not available\n'
+    egrep 'Mem|Swap' /proc/meminfo 2>/dev/null || printf 'meminfo not available\n'
   fi
-  df -h
+  df
 
   print_section "Network"
   if command -v ip >/dev/null 2>&1; then

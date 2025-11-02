@@ -47,6 +47,7 @@ legacy/                 # Original scripts retained for compatibility
 | `system-health-report` | Summarises load, memory, storage, network, and package update status. |
 | `install-telegram-bot` | Downloads and runs the installer from [`sfdcai/openwrt-telegram`](https://github.com/sfdcai/openwrt-telegram). |
 | `command-inventory` | Writes a sorted list of BusyBox applets and PATH executables to aid script portability. |
+| `wifi-maintenance` | Reloads Wi-Fi, inspects radios, and surfaces relevant log excerpts. |
 
 Each script documents extra flags via `--help` and declares `# TOOL_NAME` and
 `# TOOL_DESC` metadata so the launcher can present friendly descriptions.
@@ -89,6 +90,11 @@ Use `./openwrt-toolkit.sh --run command-inventory` to generate
 executables on the current firmware image. The report makes it easy to confirm
 which tools exist on OpenWrt 24.10 before writing new automation. Add
 `--print` to stream the inventory directly to the terminal.
+
+For quick offline reference, the repository ships with
+[`docs/openwrt-commands.txt`](docs/openwrt-commands.txt), a captured inventory
+from a stock 24.10 build that informed the command choices used throughout the
+modern scripts.
 
 ## Extend the toolkit
 1. Drop a new executable shell script in `scripts/` (or add metadata to a legacy

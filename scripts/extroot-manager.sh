@@ -86,7 +86,7 @@ verify_extroot() {
   fi
   log "Overlay is active"
   log "Checking free space"
-  df -h /overlay || true
+  df /overlay || true
   log "Scanning for fsck tools"
   if command -v e2fsck >/dev/null 2>&1 && [ -b /dev/root ]; then
     log "Consider running: e2fsck -n /dev/root"

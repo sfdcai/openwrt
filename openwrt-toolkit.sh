@@ -43,27 +43,38 @@ require_module_dirs() {
 # shellcheck disable=SC2039
 discover_tools() {
   require_module_dirs
-  modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
-  legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+
+  stamp=$(date '+%s' 2>/dev/null || echo 0)
+  modern_tmp="/tmp/openwrt-modern-${stamp}.$$"
+  legacy_tmp="/tmp/openwrt-legacy-${stamp}.$$"
+  : >"$modern_tmp"
+  : >"$legacy_tmp"
 
   for dir in $MODULE_DIRS; do
     module_dir="${SCRIPT_ROOT}/${dir}"
     [ -d "$module_dir" ] || continue
-    find "$module_dir" -maxdepth 1 -type f -name '*.sh' | while IFS= read -r script; do
+
+    for script in $module_dir/*.sh; do
+      case $script in
+        "$module_dir"/*.sh)
+          continue
+          ;;
+      esac
       [ -f "$script" ] || continue
-      if grep -q '^# TOOL_HIDDEN:[[:space:]]*true' "$script"; then
+      if grep -q '^# TOOL_HIDDEN:[[:space:]]*true' "$script" 2>/dev/null; then
         continue
       fi
+
       stem=$(basename "$script" .sh)
-      display=$(grep -m1 '^# TOOL_NAME:' "$script" | sed 's/^# TOOL_NAME:[[:space:]]*//') || true
-      desc=$(grep -m1 '^# TOOL_DESC:' "$script" | sed 's/^# TOOL_DESC:[[:space:]]*//') || true
+      display=$(sed -n 's/^# TOOL_NAME:[[:space:]]*//p' "$script" | head -n 1 2>/dev/null)
+      desc=$(sed -n 's/^# TOOL_DESC:[[:space:]]*//p' "$script" | head -n 1 2>/dev/null)
+      [ -n "$display" ] || display="$stem"
       [ -n "$desc" ] || desc="Run $(basename "$script")"
+
       if [ "$dir" = "legacy" ]; then
-        [ -n "$display" ] || display="$stem"
         key="legacy/$stem"
         printf '%s\t%s\t%s\t%s\n' "$display" "Legacy script: $desc" "$script" "$key" >>"$legacy_tmp"
       else
-        [ -n "$display" ] || display="$stem"
         key="$stem"
         printf '%s\t%s\t%s\t%s\n' "$display" "$desc" "$script" "$key" >>"$modern_tmp"
       fi
@@ -71,14 +82,15 @@ discover_tools() {
   done
 
   if [ -s "$modern_tmp" ]; then
-    while IFS= read -r line; do
+    sort "$modern_tmp" | while IFS= read -r line; do
       printf 'modern\t%s\n' "$line"
-    done <"$modern_tmp" | sort
+    done
   fi
+
   if [ -s "$legacy_tmp" ]; then
-    while IFS= read -r line; do
+    sort "$legacy_tmp" | while IFS= read -r line; do
       printf 'legacy\t%s\n' "$line"
-    done <"$legacy_tmp" | sort
+    done
   fi
 
   rm -f "$modern_tmp" "$legacy_tmp"
@@ -91,8 +103,11 @@ list_tools() {
     return
   fi
 
-  modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
-  legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+  stamp=$(date '+%s' 2>/dev/null || echo 0)
+  modern_tmp="/tmp/openwrt-list-modern-${stamp}.$$"
+  legacy_tmp="/tmp/openwrt-list-legacy-${stamp}.$$"
+  : >"$modern_tmp"
+  : >"$legacy_tmp"
 
   printf '%s\n' "$tools" | while IFS="$TAB" read -r category display desc _path key; do
     case $category in
@@ -139,6 +154,7 @@ run_tool_by_stem() {
     printf >&2 'Error: tool "%s" not found. Use --list to view options.\n' "$stem"
     exit 1
   fi
+
   display=$(printf '%s' "$match" | cut -f1)
   path=$(printf '%s' "$match" | cut -f2)
   printf 'Running %s...\n\n' "$display"
@@ -173,7 +189,7 @@ legacy_menu() {
         continue
         ;;
       *)
-        if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
+        if printf '%s' "$choice" | egrep -q '^[0-9]+$'; then
           selected=$(echo "$legacy_tools" | sed -n "${choice}p") || true
           if [ -n "$selected" ]; then
             display=$(printf '%s' "$selected" | cut -f1)
@@ -200,8 +216,11 @@ interactive_menu() {
       exit 1
     fi
 
-    modern_tmp=$(mktemp 2>/dev/null || mktemp -t modern.XXXXXX)
-    legacy_tmp=$(mktemp 2>/dev/null || mktemp -t legacy.XXXXXX)
+    stamp=$(date '+%s' 2>/dev/null || echo 0)
+    modern_tmp="/tmp/openwrt-menu-modern-${stamp}.$$"
+    legacy_tmp="/tmp/openwrt-menu-legacy-${stamp}.$$"
+    : >"$modern_tmp"
+    : >"$legacy_tmp"
 
     printf '%s\n' "$tools" | while IFS="$TAB" read -r category display desc path key; do
       case $category in
@@ -223,7 +242,7 @@ interactive_menu() {
     printf '  %2s) %s\n' "Q" "Quit"
     printf '  %2s) %s\n' "R" "Refresh list"
     if [ -n "$legacy_tools" ]; then
-      printf '  %2s) %s\n' "L" "Legacy scripts..."
+      printf '  %2s) %s\n' "L" "Legacy scripts submenu"
     fi
 
     idx=1
@@ -254,7 +273,7 @@ interactive_menu() {
         continue
         ;;
       *)
-        if printf '%s' "$choice" | grep -Eq '^[0-9]+$'; then
+        if printf '%s' "$choice" | egrep -q '^[0-9]+$'; then
           selected=$(echo "$modern_tools" | sed -n "${choice}p") || true
           if [ -n "$selected" ]; then
             display=$(printf '%s' "$selected" | cut -f1)
