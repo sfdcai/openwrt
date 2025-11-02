@@ -40,7 +40,7 @@ legacy/                 # Original scripts retained for compatibility
 | --- | --- |
 | `fix-opkg` | Repairs `opkg` feeds with backup/restore, HTTP-only mode, and dry-run execution. |
 | `install-argon-theme` | Installs or updates the Argon LuCI theme with checksum verification. |
-| `setup-usb-storage` | Prepares USB disks, swap files, and mounts for overlay or data use. |
+| `setup-usb-storage` | Prepares USB disks, swap files, and mounts for overlay or data use, with an option to install USB support packages. |
 | `extroot-manager` | Validates overlay mounts and toggles extroot entries with safe testing flows. |
 | `network-diagnostics` | Captures connectivity, DNS, and routing diagnostics into timestamped reports. |
 | `backup-config` | Creates archives of `/etc/config`, optional UCI exports, and package manifests. |

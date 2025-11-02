@@ -54,12 +54,7 @@ discover_tools() {
     module_dir="${SCRIPT_ROOT}/${dir}"
     [ -d "$module_dir" ] || continue
 
-    for script in $module_dir/*.sh; do
-      case $script in
-        "$module_dir"/*.sh)
-          continue
-          ;;
-      esac
+    for script in ${module_dir}/*.sh; do
       [ -f "$script" ] || continue
       if grep -q '^# TOOL_HIDDEN:[[:space:]]*true' "$script" 2>/dev/null; then
         continue

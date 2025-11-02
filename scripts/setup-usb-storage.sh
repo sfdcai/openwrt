@@ -20,6 +20,7 @@ Options:
   --swap <size>          Swap size in MiB to allocate (default: 256, 0 disables)
   --fs <type>            Filesystem type when formatting (default: ext4)
   --format               Format the partition before mounting
+  --install-packages     Ensure usbutils and luci-app-advanced-reboot are installed
   --dry-run              Show actions without executing them
   --help                 Display this message
 
@@ -37,6 +38,7 @@ FS_TYPE="ext4"
 DRY_RUN=0
 DO_FORMAT=0
 TARGET_PART=""
+INSTALL_PACKAGES=0
 
 log() {
   printf '[setup-usb] %s\n' "$*"
@@ -108,6 +110,10 @@ while [ $# -gt 0 ]; do
       ;;
     --format)
       DO_FORMAT=1
+      shift
+      ;;
+    --install-packages)
+      INSTALL_PACKAGES=1
       shift
       ;;
     --dry-run)
@@ -234,11 +240,39 @@ summarise() {
   fi
 }
 
+ensure_usb_support_packages() {
+  if [ "$INSTALL_PACKAGES" -ne 1 ]; then
+    return
+  fi
+  if ! command -v opkg >/dev/null 2>&1; then
+    log "opkg not available; skipping USB support package installation."
+    return
+  fi
+
+  missing_packages=""
+  for pkg in usbutils luci-app-advanced-reboot; do
+    if ! opkg list-installed "$pkg" 2>/dev/null | grep -q "^$pkg -"; then
+      missing_packages="$missing_packages $pkg"
+    fi
+  done
+
+  if [ -z "$missing_packages" ]; then
+    log "USB support packages already installed."
+    return
+  fi
+
+  run opkg update
+  for pkg in $missing_packages; do
+    run opkg install "$pkg"
+  done
+}
+
 resolve_targets
 if ! ensure_block_present "$TARGET_PART"; then
   log "Partition $TARGET_PART not found. Create it on another system or specify --partition."
   exit 1
 fi
+ensure_usb_support_packages
 format_partition
 mount_filesystem
 provision_swap
