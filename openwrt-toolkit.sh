@@ -139,7 +139,6 @@ run_tool_by_stem() {
     printf >&2 'Error: tool "%s" not found. Use --list to view options.\n' "$stem"
     exit 1
   fi
-
   display=$(printf '%s' "$match" | cut -f1)
   path=$(printf '%s' "$match" | cut -f2)
   printf 'Running %s...\n\n' "$display"
