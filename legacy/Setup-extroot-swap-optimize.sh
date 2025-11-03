@@ -1,334 +1,290 @@
 #!/bin/sh
-#
-# Advanced OpenWrt extroot and swap helper
-# ----------------------------------------
-# Adds command line options, swap management, filesystem checks, and
-# optional dry-run support to the basic extroot automation script.
+# setup-extroot-swap-optimize.sh
+# Interactive script to configure extroot (USB as /overlay), swap (file or zram),
+# noatime optimization and install Argon LuCI theme (latest release) on OpenWrt.
+# Tested on Linksys WRT1900ACS v2 (OpenWrt). Run as root.
 
-set -eu
+set -e
 
-# ===== Colours =====
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+LOG() { printf "[+] %s\n" "$1"; }
+ERR() { printf "[!] %s\n" "$1"; }
 
-info()    { printf "%s[INFO]%s %s\n" "$BLUE" "$NC" "$1"; }
-success() { printf "%s[SUCCESS]%s %s\n" "$GREEN" "$NC" "$1"; }
-warn()    { printf "%s[WARN]%s %s\n" "$YELLOW" "$NC" "$1"; }
-error()   { printf "%s[ERROR]%s %s\n" "$RED" "$NC" "$1" >&2; }
+# Helpers
+exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ===== Defaults =====
-USB_DEVICE="/dev/sda1"
-USB_MOUNT="/mnt"
-OVERLAY_UPPER="$USB_MOUNT/upper"
-OVERLAY_WORK="$USB_MOUNT/work"
-TEST_MOUNT="$USB_MOUNT/test-overlay"
-FSTAB_FILE="/etc/config/fstab"
-BACKUP_DIR="/etc/config"
-SWAP_FILE="$USB_MOUNT/swapfile"
-SWAP_SIZE_MB=512
-CREATE_SWAP=1
-KEEP_MOUNT=0
-DRY_RUN=0
-
-usage() {
-    cat <<'EOF'
-Usage: Setup-extroot-swap-optimize.sh [options]
-
-Options:
-  -d, --device PATH        Block device to use for extroot (default: /dev/sda1)
-  -m, --mount PATH         Temporary mount point for preparing the device (default: /mnt)
-      --swap-file PATH     Path for the swap file (default: /mnt/swapfile)
-      --swap-size MB       Swap file size in megabytes (default: 512)
-      --no-swap            Skip swap file creation
-      --keep-mounted       Leave the USB device mounted after completion
-      --dry-run            Show the actions without executing them
-  -h, --help               Show this help message
-
-Examples:
-  Setup-extroot-swap-optimize.sh --device /dev/sdb1 --swap-size 1024
-  Setup-extroot-swap-optimize.sh --no-swap --dry-run
-EOF
+confirm() {
+  printf "%s [y/N]: " "$1"
+  read ans
+  case "$ans" in
+    [Yy]|[Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-run_cmd() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "[DRY-RUN] $*"
-        return 0
+# Detect USB device (defaults to /dev/sda1 if present)
+detect_usb() {
+  if [ -b /dev/sda1 ]; then
+    echo "/dev/sda1"
+    return 0
+  fi
+  # fallback: list /dev/sd* and pick first partition
+  for d in /dev/sd*1; do
+    [ -b "$d" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Ensure required packages
+ensure_packages() {
+  opkg update
+  for pkg in block-mount kmod-usb-storage kmod-fs-ext4 e2fsprogs usbutils fdisk; do
+    if ! opkg list-installed | grep -q "^$pkg "; then
+      LOG "Installing $pkg"
+      opkg install "$pkg" || ERR "Failed to install $pkg (continue if already available)"
     fi
-
-    "$@"
+  done
 }
 
-safe_umount() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "[DRY-RUN] umount $1"
-        return 0
-    fi
-    umount "$1" >/dev/null 2>&1 || true
+# Format partition ext4
+format_ext4() {
+  dev="$1"
+  LOG "Formatting $dev as ext4 (this will erase data)"
+  umount "$dev" 2>/dev/null || true
+  mkfs.ext4 -F "$dev"
 }
 
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        error "This script must be run as root."
-        exit 1
-    fi
+# Mount to temporary mountpoint
+mount_temp() {
+  dev="$1"
+  mnt="$2"
+  mkdir -p "$mnt"
+  mount "$dev" "$mnt"
 }
 
-parse_args() {
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -d|--device)
-                [ $# -lt 2 ] && { error "Missing value for $1"; exit 1; }
-                USB_DEVICE="$2"
-                shift 2
-                ;;
-            -m|--mount)
-                [ $# -lt 2 ] && { error "Missing value for $1"; exit 1; }
-                USB_MOUNT="$2"
-                OVERLAY_UPPER="$USB_MOUNT/upper"
-                OVERLAY_WORK="$USB_MOUNT/work"
-                TEST_MOUNT="$USB_MOUNT/test-overlay"
-                shift 2
-                ;;
-            --swap-file)
-                [ $# -lt 2 ] && { error "Missing value for $1"; exit 1; }
-                SWAP_FILE="$2"
-                shift 2
-                ;;
-            --swap-size)
-                [ $# -lt 2 ] && { error "Missing value for $1"; exit 1; }
-                SWAP_SIZE_MB="$2"
-                shift 2
-                ;;
-            --no-swap)
-                CREATE_SWAP=0
-                shift
-                ;;
-            --keep-mounted)
-                KEEP_MOUNT=1
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                error "Unknown option: $1"
-                usage
-                exit 1
-                ;;
-        esac
-    done
+# Copy overlay content
+copy_overlay_to_usb() {
+  mnt="$1"
+  LOG "Copying current overlay to $mnt"
+  # ensure overlay exists
+  if [ -d /overlay ] && [ "$(ls -A /overlay 2>/dev/null)" ]; then
+    tar -C /overlay -cf - . | tar -C "$mnt" -xvf -
+  else
+    LOG "/overlay is empty — creating minimal overlay structure"
+    mkdir -p "$mnt/upper" "$mnt/work"
+  fi
 }
 
-validate_inputs() {
-    if [ ! -b "$USB_DEVICE" ] && [ "$DRY_RUN" -eq 0 ]; then
-        error "$USB_DEVICE is not a valid block device."
-        exit 1
-    fi
-
-    if ! printf '%s' "$SWAP_SIZE_MB" | grep -qE '^[0-9]+$'; then
-        error "Swap size must be an integer value."
-        exit 1
-    fi
-}
-
-mount_device() {
-    info "Mounting $USB_DEVICE at $USB_MOUNT"
-    run_cmd mkdir -p "$USB_MOUNT"
-    safe_umount "$USB_MOUNT"
-    safe_umount "$USB_DEVICE"
-    run_cmd mount "$USB_DEVICE" "$USB_MOUNT"
-    success "USB device mounted at $USB_MOUNT"
-}
-
-prepare_overlay_dirs() {
-    info "Preparing overlay directories"
-    run_cmd mkdir -p "$OVERLAY_UPPER" "$OVERLAY_WORK"
-    success "Overlay directories ready"
-}
-
-copy_overlay_contents() {
-    if [ -d "/overlay" ] && [ "$(ls -A /overlay 2>/dev/null)" ]; then
-        info "Copying current overlay contents"
-        run_cmd cp -a /overlay/* "$OVERLAY_UPPER/"
-        success "Overlay data copied"
-    else
-        warn "No existing overlay data to copy"
-    fi
-}
-
-test_overlay_mount() {
-    info "Testing overlay mount at $TEST_MOUNT"
-    run_cmd mkdir -p "$TEST_MOUNT"
-    run_cmd mount -t overlay overlay -o "lowerdir=/,upperdir=$OVERLAY_UPPER,workdir=$OVERLAY_WORK" "$TEST_MOUNT"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        if mount | grep -q "$TEST_MOUNT"; then
-            success "Overlay mount test succeeded"
-        else
-            error "Overlay mount verification failed"
-            exit 1
-        fi
-        run_cmd umount "$TEST_MOUNT"
-        run_cmd rmdir "$TEST_MOUNT"
-    fi
-}
-
-backup_fstab() {
-    [ "$DRY_RUN" -eq 1 ] && return
-    if [ -f "$FSTAB_FILE" ]; then
-        local backup="$BACKUP_DIR/fstab.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$FSTAB_FILE" "$backup"
-        info "fstab backup saved to $backup"
-    fi
-}
-
-configure_fstab() {
-    info "Writing fstab entry"
-    backup_fstab
-    cat <<EOF | run_cmd tee "$FSTAB_FILE" >/dev/null
+# Update /etc/config/fstab for extroot
+configure_fstab_extroot() {
+  uuid="$1"
+  cat > /etc/config/fstab <<EOF
 config global
-        option anon_swap '0'
-        option anon_mount '0'
-        option auto_swap '1'
-        option auto_mount '1'
-        option delay_root '5'
-        option check_fs '1'
+	option  anon_swap       '0'
+	option  anon_mount      '0'
+	option  auto_swap       '1'
+	option  auto_mount      '1'
+	option  delay_root      '5'
+	option  check_fs        '0'
 
 config mount
-        option target '/overlay'
-        option uuid '$USB_UUID'
-        option fstype 'ext4'
-        option options 'rw,noatime,nodiratime,data=writeback'
-        option enabled '1'
-        option enabled_fsck '1'
+	option target  '/overlay'
+	option uuid    '$uuid'
+	option fstype  'ext4'
+	option enabled '1'
+	option enabled_fsck '1'
 EOF
-    success "fstab updated"
+  LOG "/etc/config/fstab updated for extroot"
 }
 
-get_uuid() {
-    block info | grep "$USB_DEVICE" | sed 's/.*UUID="\([^"]*\)".*/\1/'
+# Enable fstab and reboot
+enable_fstab_and_reboot() {
+  /etc/init.d/fstab enable || true
+  LOG "Rebooting now..."
+  reboot
 }
 
-ensure_uuid() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        USB_UUID="DRY-RUN-UUID"
-        warn "Dry-run mode: skipping UUID lookup."
-        return
-    fi
-    info "Reading UUID from $USB_DEVICE"
-    USB_UUID=$(get_uuid)
-    if [ -z "$USB_UUID" ]; then
-        error "Unable to determine UUID for $USB_DEVICE"
-        exit 1
-    fi
-    success "USB UUID: $USB_UUID"
+# Create swapfile
+create_swapfile() {
+  mnt="$1"
+  size_mb="$2"
+  swapfile="$mnt/swapfile"
+  LOG "Creating swapfile $swapfile of ${size_mb}MB"
+  dd if=/dev/zero of="$swapfile" bs=1M count="$size_mb" || true
+  mkswap "$swapfile"
+  swapon "$swapfile"
+  # add to fstab as swap
+  uci -q delete fstab.@swap[0]
+  uci set fstab.swap0=device="$swapfile"
+  uci set fstab.swap0.enabled='1'
+  uci commit fstab
+  /etc/init.d/fstab restart || true
+  LOG "Swapfile enabled"
 }
 
-append_swap_to_fstab() {
-    [ "$CREATE_SWAP" -eq 1 ] || return
-    if [ "$DRY_RUN" -eq 0 ] && grep -q "option device '$SWAP_FILE'" "$FSTAB_FILE" 2>/dev/null; then
-        warn "Swap entry already exists in fstab. Skipping append."
-        return
-    fi
-    cat <<EOF | run_cmd tee -a "$FSTAB_FILE" >/dev/null
-
-config swap
-        option device '$SWAP_FILE'
-        option enabled '1'
-        option priority '1'
-EOF
-    success "Swap entry added to fstab"
+# Setup zram
+setup_zram() {
+  if ! opkg list-installed | grep -q zram-swap; then
+    LOG "Installing zram-swap"
+    opkg update
+    opkg install zram-swap || ERR "Failed to install zram-swap"
+  fi
+  /etc/init.d/zram-swap enable || true
+  /etc/init.d/zram-swap start || true
+  LOG "zram-swap started"
 }
 
-create_swap_file() {
-    [ "$CREATE_SWAP" -eq 1 ] || { warn "Swap creation skipped."; return; }
-    info "Creating swap file at $SWAP_FILE (${SWAP_SIZE_MB}MB)"
-    run_cmd dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB"
-    run_cmd chmod 600 "$SWAP_FILE"
-    run_cmd mkswap "$SWAP_FILE"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        swapon "$SWAP_FILE" >/dev/null 2>&1 && success "Swap activated" || warn "Swap activation deferred"
-    fi
+# Add noatime option to ext4 fstab entry (on /etc/config/fstab we don't specify mount options easily)
+# We'll also add a /etc/fstab entry to ensure noatime for /overlay device after block mount
+add_noatime_to_fstab() {
+  # Find device by uuid and write to /etc/fstab
+  uuid="$1"
+  devline=$(blkid -U "$uuid" 2>/dev/null || true)
+  if [ -n "$devline" ]; then
+    # Write /etc/fstab static line
+    echo "UUID=$uuid /overlay ext4 defaults,noatime 0 1" > /etc/fstab
+    LOG "/etc/fstab written with noatime for UUID $uuid"
+  else
+    ERR "Could not resolve UUID to device — skipping /etc/fstab noatime write"
+  fi
 }
 
-apply_optimisations() {
-    info "Applying filesystem and kernel tuning"
-    if command -v tune2fs >/dev/null 2>&1; then
-        if ! run_cmd tune2fs -o journal_data_writeback "$USB_DEVICE"; then
-            warn "tune2fs optimisation failed."
+# Install Argon theme (fetch latest release from GitHub - jerrykuku/luci-theme-argon)
+install_argon_theme_latest() {
+  LOG "Attempting to fetch latest Argon Luci theme release from GitHub"
+  apiurl="https://api.github.com/repos/jerrykuku/luci-theme-argon/releases/latest"
+  tmpjson="/tmp/argon_release.json"
+  wget -qO "$tmpjson" "$apiurl" || { ERR "Failed to fetch GitHub API"; return 1; }
+  # Extract asset URLs for luci-theme-argon and luci-app-argon-config
+  # Try to find .ipk or .apk assets
+  theme_url=$(grep -o 'https://[^" ]*luci-theme-argon[^" ]*' "$tmpjson" | head -n1)
+  app_url=$(grep -o 'https://[^" ]*luci-app-argon-config[^" ]*' "$tmpjson" | head -n1)
+  if [ -z "$theme_url" ]; then
+    ERR "Could not find theme asset in release JSON"
+    return 1
+  fi
+  cd /tmp
+  LOG "Downloading $theme_url"
+  wget --no-check-certificate -qO luci-theme-argon.pkg "$theme_url" || ERR "download failed"
+  if [ -n "$app_url" ]; then
+    LOG "Downloading $app_url"
+    wget --no-check-certificate -qO luci-app-argon-config.pkg "$app_url" || true
+  fi
+  # attempt install
+  for f in luci-*.pkg luci-*.ipk luci-*.apk; do
+    [ -f "$f" ] && { opkg install "$f" || true; }
+  done
+  LOG "Attempted Argon installation - check LuCI -> System -> Language and Style"
+}
+
+# MAIN MENU
+main_menu() {
+  echo "OpenWrt Extroot + Swap + Optimizer - Interactive"
+  echo "Detected USB device: $(detect_usb || echo 'none')"
+  echo "Current mounts:"
+  df -h
+  echo
+  echo "Choose actions (type numbers separated by spaces):"
+  echo "1) Configure extroot (copy overlay -> USB and switch to /overlay)"
+  echo "2) Format USB as ext4 (destructive)"
+  echo "3) Create swapfile on USB (select size)"
+  echo "4) Enable zram-swap"
+  echo "5) Add noatime optimization to /etc/fstab"
+  echo "6) Install Argon LuCI theme (latest release)"
+  echo "7) Apply basic performance tweaks (disable unused services, install useful packages)"
+  echo "8) Exit"
+
+  read -p "Selection: " sel
+  for choice in $sel; do
+    case "$choice" in
+      1)
+        dev=$(detect_usb) || { ERR "No USB detected"; exit 1; }
+        LOG "Will prepare extroot on $dev"
+        ensure_packages
+        mount_tmp="/mnt/usb"
+        format_choice="no"
+        if confirm "Do you want to FORMAT $dev (this will erase it)?"; then
+          format_choice="yes"
         fi
-    fi
-    if command -v sysctl >/dev/null 2>&1; then
-        if ! run_cmd sysctl -w vm.swappiness=10; then
-            warn "Unable to set vm.swappiness."
+        if [ "$format_choice" = "yes" ]; then
+          format_ext4 "$dev"
         fi
-        if ! run_cmd sysctl -w vm.vfs_cache_pressure=200; then
-            warn "Unable to set vm.vfs_cache_pressure."
+        mount_temp "$dev" "$mount_tmp"
+        copy_overlay_to_usb "$mount_tmp"
+        # get uuid
+        if exists blkid; then
+          uuid=$(blkid -s UUID -o value "$dev" || true)
+        else
+          uuid=$(cat /proc/partitions | grep -m1 $(basename "$dev") || true)
         fi
-    fi
-    success "Optimisation commands issued"
+        if [ -z "$uuid" ]; then
+          # try block info
+          uuid=$(block info | grep $(basename "$dev") -A1 | grep UUID | sed -n 's/.*UUID="\([^"]*\)".*/\1/p' || true)
+        fi
+        if [ -z "$uuid" ]; then
+          ERR "Could not determine UUID — aborting extroot configuration"
+        else
+          configure_fstab_extroot "$uuid"
+          LOG "Extroot configured. Enable fstab and reboot to switch to USB overlay"
+          if confirm "Reboot now?"; then
+            enable_fstab_and_reboot
+          fi
+        fi
+        ;;
+      2)
+        dev=$(detect_usb) || { ERR "No USB detected"; exit 1; }
+        if confirm "Really FORMAT $dev as ext4? All data will be lost"; then
+          ensure_packages
+          format_ext4 "$dev"
+          LOG "Done. You should now copy overlay or mount it where you need"
+        fi
+        ;;
+      3)
+        dev=$(detect_usb) || { ERR "No USB detected"; exit 1; }
+        mount_tmp="/mnt/usb"
+        mount_temp "$dev" "$mount_tmp"
+        echo "Choose swap size in MB (recommended 256 or 512). Enter number:"
+        read size_mb
+        create_swapfile "$mount_tmp" "$size_mb"
+        ;;
+      4)
+        setup_zram
+        ;;
+      5)
+        dev=$(detect_usb) || { ERR "No USB detected"; exit 1; }
+        if exists blkid; then
+          uuid=$(blkid -s UUID -o value "$dev" || true)
+        else
+          uuid=$(block info | grep $(basename "$dev") -A1 | grep UUID | sed -n 's/.*UUID="\([^"]*\)".*/\1/p' || true)
+        fi
+        if [ -n "$uuid" ]; then
+          add_noatime_to_fstab "$uuid"
+        else
+          ERR "Cannot find UUID for noatime"
+        fi
+        ;;
+      6)
+        install_argon_theme_latest
+        ;;
+      7)
+        LOG "Applying basic performance tweaks"
+        # Example: disable unused services (customize as needed)
+        /etc/init.d/uhttpd disable || true
+        /etc/init.d/rpcd disable || true
+        # Install useful lightweight packages
+        opkg update
+        opkg install luci-app-opkg luci-app-statistics collectd-mod-network luci-app-nlbwmon || true
+        LOG "Tweaks applied. Review services and installed packages."
+        ;;
+      8)
+        LOG "Exit requested"
+        exit 0
+        ;;
+      *)
+        ERR "Unknown option $choice"
+        ;;
+    esac
+  done
 }
 
-enable_services() {
-    info "Enabling fstab init script"
-    run_cmd /etc/init.d/fstab enable
-
-    if ! grep -q "sleep 5" /etc/rc.local 2>/dev/null; then
-        run_cmd sed -i '/^exit 0$/i sleep 5' /etc/rc.local
-        success "Boot delay added to rc.local"
-    else
-        warn "Boot delay already configured"
-    fi
-}
-
-cleanup_mounts() {
-    if [ "$KEEP_MOUNT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        safe_umount "$USB_MOUNT"
-    fi
-}
-
-summary() {
-    echo
-    echo "Summary"
-    echo "-------"
-    echo "USB device : $USB_DEVICE"
-    echo "UUID       : $USB_UUID"
-    echo "Upper dir  : $OVERLAY_UPPER"
-    echo "Work dir   : $OVERLAY_WORK"
-    echo "Swap file  : $( [ "$CREATE_SWAP" -eq 1 ] && echo "$SWAP_FILE" || echo 'disabled')"
-    echo "fstab      : $FSTAB_FILE"
-    echo
-    warn "Reboot is required to activate the new extroot."
-    info "After reboot run: mount | grep overlay"
-    info "               df -h | grep overlay"
-}
-
-main() {
-    parse_args "$@"
-    ensure_root
-    validate_inputs
-
-    info "Starting extroot + swap configuration"
-    ensure_uuid
-    mount_device
-    prepare_overlay_dirs
-    copy_overlay_contents
-    test_overlay_mount
-    configure_fstab
-    append_swap_to_fstab
-    create_swap_file
-    apply_optimisations
-    enable_services
-    cleanup_mounts
-    summary
-}
-
-main "$@"
+# Run main menu
+main_menu

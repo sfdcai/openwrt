@@ -44,14 +44,34 @@ log() {
   printf '[setup-usb] %s\n' "$*"
 }
 
+hint_for_command() {
+  cmd=$1
+  case $cmd in
+    mount)
+      log "Hint: mount failed. Ensure the partition is formatted and not already in use."
+      ;;
+    mkfs.*)
+      log "Hint: format utilities may be missing. Install e2fsprogs or confirm the device is writable."
+      ;;
+    dd)
+      log "Hint: creating the swapfile failed. Check available space on the mount point."
+      ;;
+    opkg)
+      log "Hint: opkg reported an error. Verify network connectivity and repository availability."
+      ;;
+  esac
+}
+
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
     log "DRY: $*"
   else
     log "CMD: $*"
     if ! "$@"; then
-      log "ERROR: Command failed ($*)"
-      exit 1
+      status=$?
+      log "ERROR($status): Command failed -> $*"
+      hint_for_command "$1"
+      exit "$status"
     fi
   fi
 }
@@ -86,21 +106,77 @@ guess_partition_path() {
   fi
 }
 
-list_block_candidates() {
-  ls -1 /dev 2>/dev/null \
-    | egrep '^(sd[a-z][0-9]*|mmcblk[0-9]+(p[0-9]+)?|nvme[0-9]+n[0-9]+(p[0-9]+)?)$' \
-    | while IFS= read -r entry; do
-      [ -n "$entry" ] || continue
-      printf '/dev/%s\n' "$entry"
-    done
+format_size() {
+  blocks=$1
+  if [ -z "$blocks" ]; then
+    printf 'unknown'
+    return
+  fi
+  awk -v b="$blocks" 'BEGIN {
+    mib = b / 1024;
+    if (mib >= 1024) {
+      printf "%.2f GiB", mib / 1024;
+    } else if (mib >= 1) {
+      printf "%.0f MiB", mib;
+    } else {
+      printf "%.0f KiB", b;
+    }
+  }'
+}
+
+read_device_attribute() {
+  base=$1
+  if [ -z "$base" ]; then
+    printf 'unknown'
+    return
+  fi
+
+  for attr in model name vendor; do
+    file="/sys/block/$base/device/$attr"
+    if [ -r "$file" ]; then
+      value=$(cat "$file" 2>/dev/null | tr '\n' ' ')
+      value=$(printf '%s' "$value" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+      if [ -n "$value" ]; then
+        printf '%s' "$value"
+        return
+      fi
+    fi
+  done
+
+  printf 'unknown'
+}
+
+collect_candidates() {
+  output=$1
+  : >"$output"
+  if [ ! -r /proc/partitions ]; then
+    return
+  fi
+
+  awk '{print $4":"$3}' /proc/partitions 2>/dev/null \
+    | while IFS=':' read -r name blocks; do
+        case $name in
+          sd[a-z][0-9]*|mmcblk[0-9]*p[0-9]*|nvme[0-9]*n[0-9]*p[0-9]*)
+            path="/dev/$name"
+            [ -b "$path" ] || continue
+            size=$(format_size "$blocks")
+            mount_point=$(awk -v dev="$path" '$1 == dev {print $2; exit}' /proc/mounts 2>/dev/null)
+            [ -n "$mount_point" ] || mount_point="unmounted"
+            parent=$(strip_partition_suffix "$path")
+            parent_base=$(basename "$parent")
+            model=$(read_device_attribute "$parent_base")
+            printf '%s|%s|%s|%s\n' "$path" "$size" "$mount_point" "$model" >>"$output"
+            ;;
+        esac
+      done
 }
 
 prompt_for_partition() {
   log "No device provided; attempting interactive selection."
   stamp=$(date '+%s' 2>/dev/null || echo 0)
   candidates_file="/tmp/setup-usb-candidates-${stamp}.$$"
-  list_block_candidates >"$candidates_file"
-  count=$(sed -n '$=' "$candidates_file")
+  collect_candidates "$candidates_file"
+  count=$(sed -n '$=' "$candidates_file" 2>/dev/null || echo 0)
   [ -n "$count" ] || count=0
 
   if [ "$count" -eq 0 ] 2>/dev/null; then
@@ -111,9 +187,22 @@ prompt_for_partition() {
 
   printf 'Detected storage devices:\n'
   idx=1
-  while IFS= read -r part; do
+  while IFS='|' read -r part size mount_point model; do
     [ -n "$part" ] || continue
-    printf '  %2d) %s\n' "$idx" "$part"
+    mount_desc=$mount_point
+    case $mount_desc in
+      ''|unmounted)
+        mount_desc='not mounted'
+        ;;
+      *)
+        mount_desc="mounted at $mount_desc"
+        ;;
+    esac
+    if [ -n "$model" ] && [ "$model" != "unknown" ]; then
+      printf '  %2d) %s (%s, %s, %s)\n' "$idx" "$part" "$size" "$mount_desc" "$model"
+    else
+      printf '  %2d) %s (%s, %s)\n' "$idx" "$part" "$size" "$mount_desc"
+    fi
     idx=$((idx + 1))
   done <"$candidates_file"
 
@@ -139,7 +228,8 @@ prompt_for_partition() {
         ;;
       *)
         if [ "$answer" -ge 1 ] 2>/dev/null && [ "$answer" -le "$count" ] 2>/dev/null; then
-          candidate=$(sed -n "${answer}p" "$candidates_file")
+          candidate_line=$(sed -n "${answer}p" "$candidates_file" 2>/dev/null)
+          candidate=$(printf '%s' "$candidate_line" | cut -d '|' -f1)
         else
           printf 'Invalid selection.\n'
           continue
@@ -172,7 +262,7 @@ prompt_for_partition() {
       return
     fi
 
-    printf '%s is not a block device.\n' "$chosen"
+    printf '%s is not a usable block device.\n' "$chosen"
   done
 }
 
@@ -257,7 +347,14 @@ resolve_targets() {
 
 ensure_block_present() {
   path=$1
+  if [ ! -e "$path" ]; then
+    log "Device $path not found. Verify the USB drive is connected."
+    return 1
+  fi
   if [ ! -b "$path" ]; then
+    type=$(ls -ld "$path" 2>/dev/null | awk '{print $1}')
+    [ -n "$type" ] || type='unknown type'
+    log "$path exists but is $type instead of a block device."
     return 1
   fi
   return 0
